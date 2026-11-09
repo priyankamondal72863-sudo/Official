@@ -132,6 +132,15 @@ def init_db():
         m_ = re.search(r"(\d+)\s*(hours?|hrs?|h)\b", (r_[1] or "").lower())
         if m_:
             c.execute("UPDATE plans SET hours=? WHERE id=?", (int(m_.group(1)), r_[0]))
+    for tbl, cols_ in (("topups", (("provider", "TEXT NOT NULL DEFAULT 'fam'"), ("ref", "TEXT DEFAULT ''"), ("pay_uri", "TEXT DEFAULT ''"),
+                                   ("checkout_url", "TEXT DEFAULT ''"), ("app_pay", "INTEGER NOT NULL DEFAULT 0"),
+                                   ("purpose", "TEXT NOT NULL DEFAULT 'wallet'"))),
+                       ("products", (("icon", "TEXT DEFAULT ''"), ("emoji_id", "TEXT DEFAULT ''"), ("icon_ver", "INTEGER NOT NULL DEFAULT 0")))):
+        have = [r[1] for r in c.execute("PRAGMA table_info(%s)" % tbl)]
+        for col, ddl in cols_:
+            if col not in have:
+                c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (tbl, col, ddl))
+    c.execute("CREATE TABLE IF NOT EXISTS zy_events(id TEXT PRIMARY KEY, ts INTEGER NOT NULL)")
     rcols = [r[1] for r in c.execute("PRAGMA table_info(resellers)")]
     for col, ddl in (("theme", "TEXT DEFAULT ''"), ("tg_chat", "TEXT DEFAULT ''"),
                      ("otp_on", "INTEGER NOT NULL DEFAULT 1"), ("notify", "INTEGER NOT NULL DEFAULT 1"),
@@ -375,7 +384,8 @@ def catalog(rid):
             sc = q("SELECT COUNT(*) FROM stock WHERE plan_id=? AND used=0", (pl["id"],), one=True)[0]
             plans.append(dict(id=pl["id"], name=pl["name"], days=pl["days"], hours=pl["hours"] or 0, price=price, custom=custom,
                               mode=pl["mode"] or "random", stock=sc))
-        out.append(dict(id=p["id"], name=p["name"], plans=plans))
+        icon = ("/picon/%d?v=%d" % (p["id"], p["icon_ver"] or 0)) if p["icon"] else ("/emoji/" + p["emoji_id"] if p["emoji_id"] else "")
+        out.append(dict(id=p["id"], name=p["name"], plans=plans, icon=icon))
     return out
 
 
@@ -540,6 +550,168 @@ def gw_verify(order_id):
     return None
 
 
+# ---- PAYTM gateway = ZYVO PAY API (signed JSON requests, https://zyvopay.site/api)
+ZY_DEFAULT_BASE = "https://zyvopay.site/api"
+_HTTP = requests.Session()
+
+
+def zy_conf():
+    key = (get_setting("zy_key") or os.environ.get("ZYVOPAY_API_KEY") or "").strip()
+    wh = (get_setting("zy_whsec") or os.environ.get("ZYVOPAY_WEBHOOK_SECRET") or "").strip()
+    base = (get_setting("zy_base") or os.environ.get("ZYVOPAY_BASE_URL") or ZY_DEFAULT_BASE).strip().rstrip("/")
+    return key, wh, base
+
+
+def zy_ready():
+    key = zy_conf()[0]
+    return "." in key and len(key.split(".", 1)[1]) > 0
+
+
+def gw_active():
+    return "paytm" if get_setting("gw_active", "fam") == "paytm" else "fam"
+
+
+def gw_is_ready():
+    return zy_ready() if gw_active() == "paytm" else bool(get_setting("gw_key"))
+
+
+class ZyError(Exception):
+    pass
+
+
+ZY_MSG = {400: "Payment request was rejected (bad data).", 401: "Paytm gateway key is wrong (Admin > Gateway).",
+          402: "Paytm gateway account has no balance/plan.", 404: "Payment not found.", 405: "Gateway method not allowed.",
+          409: "This payment already exists.", 422: "Payment data is not valid.", 429: "Too many requests. Try again in a minute."}
+
+
+def zy_call(path, body=None, method="POST"):
+    """Signed call. The JSON is serialized ONCE and exactly those bytes are signed: HMAC-SHA256(secret, timestamp + '.' + body)."""
+    key, _, base = zy_conf()
+    if "." not in key:
+        raise ZyError("Paytm gateway is not set up (Admin > Gateway)")
+    secret = key.split(".", 1)[1]                      # only the secret part signs; the full key goes in X-API-Key
+    raw = json.dumps(body, separators=(",", ":")).encode("utf-8") if method == "POST" else b""
+    last = None
+    for attempt in range(3):                            # retries ONLY for network errors / 5xx
+        ts = str(int(time.time()))
+        sig = hmac.new(secret.encode(), ts.encode() + b"." + raw, hashlib.sha256).hexdigest()
+        hdr = {"Content-Type": "application/json", "X-API-Key": key, "X-Timestamp": ts, "X-Signature": sig}
+        try:
+            r = _HTTP.request(method, base + path, data=raw if method == "POST" else None, headers=hdr, timeout=(4, 10))
+        except requests.RequestException as e:
+            last = ZyError("Paytm gateway is not reachable. Please try again.")
+            print("[zyvo] network error %s %s" % (path, type(e).__name__))
+            time.sleep(0.6 * (attempt + 1))
+            continue
+        if r.status_code >= 500:
+            last = ZyError("Paytm gateway is busy. Please try again.")
+            print("[zyvo] %s %s -> %s req-id=%s" % (method, path, r.status_code, r.headers.get("X-Request-Id", "-")))
+            time.sleep(0.6 * (attempt + 1))
+            continue
+        try:
+            j = r.json()
+        except ValueError:
+            raise ZyError("Paytm gateway sent an unreadable answer (HTTP %s)" % r.status_code)
+        if r.status_code >= 400:
+            detail = ""
+            if isinstance(j, dict):
+                detail = str(j.get("message") or j.get("error") or "")[:120]
+            print("[zyvo] %s %s -> %s req-id=%s %s" % (method, path, r.status_code, r.headers.get("X-Request-Id", "-"), detail))
+            raise ZyError((ZY_MSG.get(r.status_code) or "Paytm gateway error %s." % r.status_code) + ((" (%s)" % detail) if detail else ""))
+        d = j.get("data") if isinstance(j, dict) and isinstance(j.get("data"), dict) else j
+        if not isinstance(d, dict):
+            raise ZyError("Paytm gateway answer has no data")
+        return d
+    raise last or ZyError("Paytm gateway error")
+
+
+def parse_exp(v):
+    if isinstance(v, (int, float)) and v > 0:
+        return int(v / 1000) if v > 1e11 else int(v)
+    if isinstance(v, str) and v.strip().isdigit():
+        return parse_exp(int(v.strip()))
+    return parse_iso(v)
+
+
+def zy_create(order_id, amount):
+    amt = int(amount) if float(amount) == int(amount) else round(float(amount), 2)
+    d = zy_call("/create-payment.php", {"order_id": order_id, "amount": amt, "currency": "INR"})
+    ref = str(d.get("reference") or "")
+    if not ref:
+        raise ZyError("Paytm gateway did not return a payment reference")
+    return dict(ref=ref, pay_uri=str(d.get("payment_uri") or ""), qr_url=str(d.get("qr_image_url") or ""),
+                app_pay=1 if d.get("app_payment_available") else 0, checkout=str(d.get("checkout_url") or ""),
+                exp=parse_exp(d.get("expires_at") or d.get("expiry") or d.get("expires")), status=str(d.get("status") or "pending"))
+
+
+def zy_check(t):
+    """Signed status check. Returns {'utr','amount'} ONLY if status is 'successful' and reference / order / currency / amount all match."""
+    try:
+        d = zy_call("/check-payment.php", {"reference": t["ref"], "order_id": t["order_id"]})
+    except ZyError:
+        return None
+    st = str(d.get("status") or "").lower()
+    if st in ("failed", "expired") and t["status"] == "pending":
+        q("UPDATE topups SET status='expired' WHERE id=? AND status='pending'", (t["id"],), commit=True)
+    if st != "successful":
+        return None
+    if str(d.get("reference") or t["ref"]) != t["ref"] or str(d.get("order_id") or t["order_id"]) != t["order_id"]:
+        return None
+    if str(d.get("currency") or "INR").upper() != "INR":
+        return None
+    try:
+        if abs(float(d.get("amount")) - float(t["amount"])) > 0.001:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return {"utr": "ZY:" + t["ref"], "amount": t["amount"]}
+
+
+def qr_matrix(data):
+    import qrcode
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=1, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    return qr.get_matrix()
+
+
+def qr_svg(data):
+    """Simple black-on-white QR (same look for both gateways), made locally from the exact payment_uri: instant, nothing is sent anywhere."""
+    m = qr_matrix(data)
+    n = len(m)
+    path = []
+    for y, row in enumerate(m):
+        x = 0
+        while x < n:
+            if row[x]:
+                x0 = x
+                while x < n and row[x]:
+                    x += 1
+                path.append("M%d %dh%dv1h-%dz" % (x0, y, x - x0, x - x0))
+            else:
+                x += 1
+    return Markup('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" shape-rendering="crispEdges" role="img" aria-label="UPI QR">'
+                  '<rect width="%d" height="%d" fill="#fff"/><path d="%s" fill="#000"/></svg>' % (n, n, n, n, "".join(path)))
+
+
+def qr_png(data):
+    from PIL import Image
+    import io
+    m = qr_matrix(data)
+    n, k = len(m), 12
+    im = Image.new("L", (n * k, n * k), 255)
+    px = im.load()
+    for y, row in enumerate(m):
+        for x, v in enumerate(row):
+            if v:
+                for dy in range(k):
+                    for dx in range(k):
+                        px[x * k + dx, y * k + dy] = 0
+    b = io.BytesIO()
+    im.save(b, "PNG")
+    return b.getvalue()
+
+
 def parse_iso(v):
     try:
         from datetime import datetime
@@ -566,11 +738,19 @@ def credit_topup(tid, d):
             c.execute("COMMIT")
             return False
         c.execute("UPDATE topups SET status='paid', utr=?, paid_at=? WHERE id=?", (utr, int(time.time()), tid))
-        c.execute("UPDATE resellers SET balance=balance+? WHERE id=?", (t["amount"], t["reseller_id"]))
+        upgrade = t["purpose"] == "upgrade"
+        if upgrade:                                         # paid "Reseller Update": the account becomes a reseller, no balance is added
+            c.execute("UPDATE resellers SET role='reseller', otp_on=1 WHERE id=? AND role='user'", (t["reseller_id"],))
+            c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", ("upg_%d" % t["reseller_id"], "1"))
+        else:
+            c.execute("UPDATE resellers SET balance=balance+? WHERE id=?", (t["amount"], t["reseller_id"]))
         c.execute("COMMIT")
         try:
             rr = c.execute("SELECT * FROM resellers WHERE id=?", (t["reseller_id"],)).fetchone()
-            notify_topup(rr, t["amount"])
+            if upgrade:
+                notify_upgrade(rr, t["amount"])
+            else:
+                notify_topup(rr, t["amount"])
         except Exception:
             pass
         return True
@@ -593,8 +773,10 @@ def check_topup(t):
         q("UPDATE topups SET status='expired' WHERE id=? AND status='pending'", (t["id"],), commit=True)
     elif t["status"] == "expired" and now - t["created"] > 3600:
         return "expired"
+    if t["provider"] == "zyvo" and not t["ref"]:
+        return t["status"]
     q("UPDATE topups SET last_check=? WHERE id=?", (now, t["id"]), commit=True)
-    d = gw_verify(t["order_id"])
+    d = zy_check(t) if t["provider"] == "zyvo" else gw_verify(t["order_id"])
     if d and credit_topup(t["id"], d):
         return "paid"
     return q("SELECT status FROM topups WHERE id=?", (t["id"],), one=True)["status"]
@@ -642,8 +824,14 @@ def reseller_required(f):
             session.clear()
             return redirect("/login")
         if r["role"] != "user" and dev_check_on() and not device_ok(r["id"]):      # devices are for resellers only
-            session.clear()
-            return blocked_page()
+            if get_setting("upg_%d" % r["id"]) == "1" and re.fullmatch(r"[0-9a-f]{32}", request.cookies.get("rgd", "")):
+                set_setting("upg_%d" % r["id"], "0")          # just upgraded: this logged-in browser becomes his first approved device
+                q("INSERT INTO devices(reseller_id,dev_id,label,ip,status,created,decided,last_seen) VALUES(?,?,?,?,?,?,?,?)",
+                  (r["id"], request.cookies["rgd"], ua_label(request.headers.get("User-Agent", "")), request.remote_addr,
+                   "approved", int(time.time()), int(time.time()), int(time.time())), commit=True)
+            else:
+                session.clear()
+                return blocked_page()
         request.r = r
         return f(*a, **k)
     return w
@@ -836,6 +1024,18 @@ def notify_purchase(r, pl, price, bal, key, via):
         import traceback
         traceback.print_exc()
         bot._note(False, "-", "purchase alert (%s)" % who, "error: %s" % str(e)[:150])
+
+
+def notify_upgrade(r, amount):
+    if not r:
+        return
+    try:
+        if tg_admin():
+            bot.send(tg_admin(), "<blockquote>\U0001F195 <b>RESELLER UPDATE</b></blockquote>\n\U0001F464 User: <b>%s</b> is now a RESELLER\n"
+                                 "\U0001F4B8 Paid: <b>%s</b>\n\U0001F552 %s" % (esc(r["username"]), inr(amount), fmt(time.time())),
+                     what="reseller upgrade (%s)" % r["username"])
+    except Exception:
+        pass
 
 
 def notify_topup(r, amount, how="UPI (auto)"):
@@ -1511,68 +1711,165 @@ def my_topup(tid):
 @app.route("/wallet")
 @reseller_required
 def wallet():
-    tops = q("SELECT * FROM topups WHERE reseller_id=? ORDER BY id DESC LIMIT 8", (request.r["id"],))
+    tops = q("SELECT * FROM topups WHERE reseller_id=? AND purpose='wallet' ORDER BY id DESC LIMIT 8", (request.r["id"],))
     return render_template("wallet.html", r=request.r, amts=wallet_amounts(), tops=tops,
-                           ready=bool(get_setting("gw_key")), page="wallet")
+                           ready=gw_is_ready(), page="wallet")
+
+
+def start_payment(rid, amt, purpose):
+    """Create a payment on the ACTIVE gateway (Fampay or Paytm) and save it. Returns topup id. Raises on error."""
+    now, prov = int(time.time()), gw_active()
+    ex = q("SELECT id FROM topups WHERE reseller_id=? AND amount=? AND purpose=? AND provider=? AND status='pending' AND deadline>? "
+           "ORDER BY id DESC", (rid, amt, purpose, prov, now), one=True)
+    if ex:
+        return ex["id"]
+    if q("SELECT COUNT(*) FROM topups WHERE reseller_id=? AND status='pending' AND deadline>?", (rid, now), one=True)[0] >= 5:
+        raise ValueError("Too many pending payments. Please wait a few minutes.")
+    if prov == "paytm":
+        oid = "NP%d%s" % (rid, secrets.token_hex(6))          # unique, stable order id (saved BEFORE the gateway is called)
+        tid = q("INSERT INTO topups(reseller_id,amount,order_id,qr_url,upi_id,status,created,expires,deadline,provider,purpose) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (rid, amt, oid, "", "", "pending", now, now + 300, now + 300, "zyvo", purpose), commit=True)
+        try:
+            d = zy_create(oid, amt)
+        except Exception:
+            q("DELETE FROM topups WHERE id=?", (tid,), commit=True)
+            raise
+        exp = d["exp"] or now + 300
+        q("UPDATE topups SET ref=?, pay_uri=?, qr_url=?, app_pay=?, checkout_url=?, expires=?, deadline=? WHERE id=?",
+          (d["ref"], d["pay_uri"], d["qr_url"], d["app_pay"], d["checkout"], exp, min(max(now + 300, exp), now + 1800), tid), commit=True)
+        return tid
+    d = gw_create(amt)
+    exp = parse_iso(d.get("expires_at"))
+    return q("INSERT INTO topups(reseller_id,amount,order_id,qr_url,upi_id,status,created,expires,deadline,provider,purpose) "
+             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+             (rid, amt, str(d["order_id"]), gw_abs(d["qr_url"]), str(d.get("upi_id") or ""), "pending", now,
+              exp or now + 300, min(max(now + 300, exp), now + 1800), "fam", purpose), commit=True)
 
 
 @app.route("/wallet/create", methods=["POST"])
 @reseller_required
 def wallet_create():
-    rid, now = request.r["id"], int(time.time())
     amt = int(num(request.form.get("amount")))
     if amt not in wallet_amounts():
         flash("Please choose one of the listed amounts", "err")
         return redirect("/wallet")
-    ex = q("SELECT id FROM topups WHERE reseller_id=? AND amount=? AND status='pending' AND deadline>? ORDER BY id DESC",
-           (rid, amt, now), one=True)
-    if ex:
-        return redirect("/wallet/pay/%d" % ex["id"])
-    if q("SELECT COUNT(*) FROM topups WHERE reseller_id=? AND status='pending' AND deadline>?", (rid, now), one=True)[0] >= 5:
-        flash("Too many pending payments. Please wait a few minutes.", "err")
-        return redirect("/wallet")
     try:
-        d = gw_create(amt)
+        tid = start_payment(request.r["id"], amt, "wallet")
     except Exception as e:
         flash("Could not create the QR: %s" % e, "err")
         return redirect("/wallet")
-    exp = parse_iso(d.get("expires_at"))
-    tid = q("INSERT INTO topups(reseller_id,amount,order_id,qr_url,upi_id,status,created,expires,deadline) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (rid, amt, str(d["order_id"]), gw_abs(d["qr_url"]), str(d.get("upi_id") or ""), "pending", now,
-             exp or now + 300, min(max(now + 300, exp), now + 1800)), commit=True)
     return redirect("/wallet/pay/%d" % tid)
+
+
+def upgrade_price():
+    return int(num(get_setting("upgrade_price", "0")))
+
+
+@app.route("/upgrade", methods=["GET", "POST"])
+@reseller_required
+def upgrade():
+    r = request.r
+    if r["role"] != "user":
+        return redirect("/dashboard")
+    price = upgrade_price()
+    if request.method == "POST":
+        if price <= 0 or not gw_is_ready():
+            flash("Reseller Update is not available right now.", "err")
+            return redirect("/upgrade")
+        try:
+            tid = start_payment(r["id"], price, "upgrade")
+        except Exception as e:
+            flash("Could not create the QR: %s" % e, "err")
+            return redirect("/upgrade")
+        return redirect("/wallet/pay/%d" % tid)
+    return render_template("upgrade.html", r=r, price=price, ready=gw_is_ready(), page="upgrade")
 
 
 @app.route("/wallet/pay/<int:tid>")
 @reseller_required
 def wallet_pay(tid):
-    check_topup(my_topup(tid))
-    t = my_topup(tid)
+    t = my_topup(tid)                                   # no gateway call here: the page opens instantly, polling does the checking
     r = q("SELECT * FROM resellers WHERE id=?", (request.r["id"],), one=True)
-    return render_template("wallet_pay.html", r=r, t=t, left=max(int(t["deadline"] - time.time()), 0), page="wallet")
+    svg = None
+    if t["provider"] == "zyvo" and (t["pay_uri"] or "").strip():
+        try:
+            svg = qr_svg(t["pay_uri"])
+        except Exception as e:
+            print("[qr] %s" % e)
+    pay_uri = t["pay_uri"] if (t["pay_uri"] or "").lower().startswith("upi:") and t["app_pay"] else ""
+    chk = t["checkout_url"] if (t["checkout_url"] or "").startswith("https://") else ""
+    return render_template("wallet_pay.html", r=r, t=t, left=max(int(t["deadline"] - time.time()), 0), qr_svg=svg,
+                           pay_uri=pay_uri, checkout=chk, page="upgrade" if t["purpose"] == "upgrade" else "wallet")
 
 
 @app.route("/wallet/status/<int:tid>")
 @reseller_required
 def wallet_status(tid):
     st = check_topup(my_topup(tid))
-    return jsonify(status=st, balance=q("SELECT balance FROM resellers WHERE id=?", (request.r["id"],), one=True)[0])
+    me = q("SELECT balance, role FROM resellers WHERE id=?", (request.r["id"],), one=True)
+    return jsonify(status=st, balance=me["balance"], role=me["role"])
 
 
 @app.route("/wallet/qr/<int:tid>")
 @reseller_required
 def wallet_qr(tid):
     t = my_topup(tid)
-    if not (t["qr_url"] or "").startswith(gw_base()):
+    name = re.sub(r"\W", "", t["order_id"] or "qr")
+    if t["provider"] == "zyvo" and (t["pay_uri"] or "").strip():
+        try:
+            return Response(qr_png(t["pay_uri"]), mimetype="image/png",
+                            headers={"Content-Disposition": 'attachment; filename="%s.png"' % name})
+        except Exception:
+            abort(502)
+    base = zy_conf()[2].rsplit("/api", 1)[0] if t["provider"] == "zyvo" else gw_base()
+    if not (t["qr_url"] or "").startswith(base):
         abort(404)
     try:
-        r = requests.get(t["qr_url"], timeout=20)
+        r = _HTTP.get(t["qr_url"], timeout=10)
         r.raise_for_status()
     except Exception:
         abort(502)
     return Response(r.content, mimetype=r.headers.get("Content-Type", "image/png"),
-                    headers={"Content-Disposition": 'attachment; filename="%s.png"' % re.sub(r"\W", "", t["order_id"] or "qr")})
+                    headers={"Content-Disposition": 'attachment; filename="%s.png"' % name})
+
+
+def _zy_webhook_work(ref, order_id, event):
+    t = q("SELECT * FROM topups WHERE provider='zyvo' AND (ref=? OR order_id=?)", (ref, order_id), one=True)
+    if not t:
+        return
+    if event == "payment.successful":
+        check_topup(t)                                  # trusted path: re-verified with a signed status call before crediting
+    elif t["status"] == "pending":
+        q("UPDATE topups SET status='expired' WHERE id=? AND status='pending'", (t["id"],), commit=True)
+
+
+@app.route("/zyvo/webhook", methods=["POST"])
+def zyvo_webhook():
+    raw = request.get_data()                            # untouched raw body, read BEFORE any JSON parsing
+    ip = request.remote_addr or "?"
+    sec = zy_conf()[1]
+    got = request.headers.get("X-ZyvoPay-Signature", "")
+    if rl_blocked("zywh:" + ip, 30, 600):
+        return jsonify(ok=False), 429
+    if not sec or not got or not same(hmac.new(sec.encode(), raw, hashlib.sha256).hexdigest(), got.strip().lower()):
+        rl_hit("zywh:" + ip)
+        return jsonify(ok=False, error="invalid signature"), 401
+    try:
+        j = json.loads(raw.decode("utf-8"))
+        ev = str(j.get("event") or "")
+        d = j.get("data") if isinstance(j.get("data"), dict) else {}
+        ref, oid = str(d.get("reference") or ""), str(d.get("order_id") or "")
+    except Exception:
+        return jsonify(ok=False, error="bad payload"), 400
+    if ev not in ("payment.successful", "payment.failed", "payment.expired") or not (ref or oid):
+        return jsonify(ok=True, ignored=True)
+    eid = hashlib.sha256(("%s|%s|%s" % (ev, ref or oid, ev)).encode()).hexdigest()
+    try:
+        q("INSERT INTO zy_events(id,ts) VALUES(?,?)", (eid, int(time.time())), commit=True)
+    except sqlite3.IntegrityError:
+        return jsonify(ok=True, duplicate=True)         # same event again: already handled
+    threading.Thread(target=_zy_webhook_work, args=(ref, oid, ev), daemon=True, name="zy-webhook").start()
+    return jsonify(ok=True)
 
 
 @app.route("/broadcast")
@@ -1807,6 +2104,30 @@ def admin_products():
                   (name, days, hours, price, uprice, mode, plid), commit=True)
         elif a == "del_plan":
             q("DELETE FROM plans WHERE id=?", (int(request.form["plan_id"]),), commit=True)
+        elif a == "product_icon":
+            pid = int(num(request.form.get("product_id")))
+            cid = request.form.get("emoji_id", "").strip()
+            if cid and not re.fullmatch(r"\d{5,25}", cid):
+                flash("Premium emoji ID must be numbers only (5-25 digits)", "err")
+            elif q("SELECT 1 FROM products WHERE id=?", (pid,), one=True):
+                q("UPDATE products SET emoji_id=?, icon_ver=icon_ver+1 WHERE id=?", (cid, pid), commit=True)
+                fl = request.files.get("icon")
+                if request.form.get("remove_icon"):
+                    q("UPDATE products SET icon='' WHERE id=?", (pid,), commit=True)
+                elif fl and fl.filename:
+                    try:
+                        from PIL import Image
+                        import io
+                        im = Image.open(fl.stream)
+                        im.load()
+                        im = im.convert("RGBA")
+                        im.thumbnail((128, 128))
+                        buf = io.BytesIO()
+                        im.save(buf, "PNG")
+                        q("UPDATE products SET icon=? WHERE id=?", (base64.b64encode(buf.getvalue()).decode(), pid), commit=True)
+                    except Exception:
+                        flash("That file is not a picture", "err")
+                flash("Product icon saved", "ok")
         elif a == "del_product":
             q("DELETE FROM products WHERE id=?", (int(request.form["product_id"]),), commit=True)
         return redirect("/admin/products")
@@ -2039,6 +2360,10 @@ def admin_reseller(rid):
             flash("Password changed", "ok")
         elif a == "toggle":
             q("UPDATE resellers SET active=1-active WHERE id=?", (rid,), commit=True)
+        elif a == "make_reseller" and r["role"] == "user":
+            q("UPDATE resellers SET role='reseller', otp_on=1 WHERE id=?", (rid,), commit=True)
+            set_setting("upg_%d" % rid, "1")
+            flash("%s is a RESELLER now" % r["username"], "ok")
         elif a == "tg":
             tg = request.form.get("tg_chat", "").strip()
             if tg and not re.fullmatch(r"-?\d{5,15}", tg):
@@ -2083,30 +2408,72 @@ def admin_gateway():
     test = None
     if request.method == "POST":
         f = request.form
-        if f.get("action") == "save":
+        a = f.get("action")
+        if a == "set_gw":                               # the TOGGLE: Paytm ON = Fampay OFF, Paytm OFF = Fampay ON
+            want = "paytm" if f.get("gw") == "paytm" else "fam"
+            if want == "paytm" and not zy_ready():
+                flash("Save the Paytm API key first, then switch it ON.", "err")
+            elif want == "fam" and not get_setting("gw_key"):
+                flash("Fampay is not set up (no API token saved).", "err")
+            else:
+                set_setting("gw_active", want)
+                flash("Paytm is ON - Fampay is OFF" if want == "paytm" else "Fampay is ON - Paytm is OFF", "ok")
+            return redirect("/admin/gateway")
+        if a == "save_common":
+            amts = sorted({int(x) for x in re.split(r"[,\s]+", f.get("amounts", "")) if x.isdigit() and 1 <= int(x) <= 100000})
+            if amts:
+                set_setting("wallet_amounts", ",".join(str(x) for x in amts[:12]))
+            up = f.get("upgrade_price", "").strip()
+            if up == "" or up.isdigit():
+                set_setting("upgrade_price", up or "0")
+            flash("Saved", "ok")
+            return redirect("/admin/gateway")
+        if a == "save_zy":
+            key, wh, base = f.get("zy_key", "").strip(), f.get("zy_whsec", "").strip(), f.get("zy_base", "").strip().rstrip("/")
+            if base and not base.startswith("https://"):
+                flash("Paytm API URL must start with https://", "err")
+                return redirect("/admin/gateway")
+            if key:
+                if "." not in key:
+                    flash("The API key must look like  public.secret  (the full token from your ZYVO PAY dashboard)", "err")
+                    return redirect("/admin/gateway")
+                set_setting("zy_key", key)
+            if wh:
+                set_setting("zy_whsec", wh)
+            set_setting("zy_base", base or ZY_DEFAULT_BASE)
+            flash("Paytm settings saved", "ok")
+            return redirect("/admin/gateway")
+        if a == "test_zy":
+            try:
+                oid = "TEST%s" % secrets.token_hex(6)
+                d = zy_create(oid, 1)
+                test = dict(ok=True, svg=qr_svg(d["pay_uri"]) if d["pay_uri"] else None, img=d["qr_url"], order=oid, who="Paytm")
+            except Exception as e:
+                test = dict(ok=False, msg=str(e), who="Paytm")
+        elif a == "save":
             base = f.get("base", "").strip().rstrip("/")
             if not re.match(r"^https?://", base):
                 flash("Gateway URL must start with http:// or https://", "err")
                 return redirect("/admin/gateway")
-            amts = sorted({int(x) for x in re.split(r"[,\s]+", f.get("amounts", "")) if x.isdigit() and 1 <= int(x) <= 100000})
-            if amts:
-                set_setting("wallet_amounts", ",".join(str(x) for x in amts[:12]))
             set_setting("gw_base", base)
             set_setting("gw_upi", f.get("upi", "").strip())
             if f.get("token", "").strip():
                 set_setting("gw_key", f["token"].strip())
-            flash("Gateway settings saved", "ok")
+            flash("Fampay settings saved", "ok")
             return redirect("/admin/gateway")
-        try:                                   # test: Rs.1 order, never credited to anybody
-            d = gw_create(1)
-            test = dict(ok=True, qr=gw_abs(d["qr_url"]), order=d["order_id"], upi=d.get("upi_id"))
-        except Exception as e:
-            test = dict(ok=False, msg=str(e))
+        elif a == "test":
+            try:                                   # test: Rs.1 order, never credited to anybody
+                d = gw_create(1)
+                test = dict(ok=True, img=gw_abs(d["qr_url"]), order=d["order_id"], who="Fampay")
+            except Exception as e:
+                test = dict(ok=False, msg=str(e), who="Fampay")
     key = get_setting("gw_key")
+    zk, zw, zb = zy_conf()
     tops = q("SELECT t.*, r.username FROM topups t JOIN resellers r ON r.id=t.reseller_id ORDER BY t.id DESC LIMIT 20")
     return render_template("admin_gateway.html", base=gw_base(), upi=get_setting("gw_upi"),
                            tail=key[-4:] if key else "", test=test, tops=tops, amounts=", ".join(str(x) for x in wallet_amounts()),
-                           page="gateway")
+                           active=gw_active(), zy_tail=zk[-4:] if zk else "", zy_wh=bool(zw), zy_base=zb, zy_ok=zy_ready(),
+                           upgrade_price=upgrade_price(), hook=request.host_url.rstrip("/") + "/zyvo/webhook", page="gateway")
 
 
 @app.route("/admin/telegram", methods=["GET", "POST"])
@@ -2228,6 +2595,25 @@ def valid_emoji_key(k):
     """A plain emoji (1-12 characters, no letters/digits/spaces) that can be replaced by a premium emoji."""
     k = (k or "").strip()
     return 0 < len(k) <= 12 and not re.search(r"[A-Za-z0-9\s<>&]", k) and any(ord(c) > 0x2000 for c in k)
+
+
+@app.route("/picon/<int:pid>")
+def product_icon(pid):
+    r = q("SELECT icon FROM products WHERE id=?", (pid,), one=True)
+    if not r or not r["icon"]:
+        abort(404)
+    resp = make_response(base64.b64decode(r["icon"]))
+    resp.headers["Content-Type"] = "image/png"
+    resp.headers["Cache-Control"] = "public, max-age=604800"
+    return resp
+
+
+@app.route("/emoji/<cid>")
+def public_emoji(cid):
+    """Picture of a Telegram premium emoji (product icon). Only for logged-in people."""
+    if not (session.get("rid") or session.get("admin")) or not re.fullmatch(r"\d{5,25}", cid):
+        abort(404)
+    return admin_emoji_thumb.__wrapped__(cid)
 
 
 @app.route("/admin/emoji/thumb/<cid>")

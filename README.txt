@@ -163,3 +163,19 @@ USERS: separate admin menu item "Users" (never mixed into Resellers). Tabs Activ
   Ban / Unban, Delete (soft, can be restored), Restore, Delete forever (only from the Deleted tab). Same buttons for resellers.
   Banned / deleted accounts cannot login and their API token stops working.
 NEXT (part 2): Paytm gateway + Fampay toggle + simple QR, product logo / premium emoji, "Reseller Update" for users.
+
+---- v12 (part 2: Paytm gateway, QR, product icons, Reseller Update) ----
+GATEWAY TOGGLE: Admin > Gateway > "Active gateway": Fampay / Paytm. Paytm ON = Fampay OFF, Paytm OFF = Fampay ON. Only the active one creates new QR codes
+  (payments already created on the other one still finish). Paytm = ZYVO PAY API (https://zyvopay.site/api).
+PAYTM SETUP: Admin > Gateway > Paytm: paste the API key (public.secret) + webhook secret -> Save -> "Generate Paytm test QR" (Rs.1, never credited) -> switch Paytm ON.
+  (or Render env ZYVOPAY_API_KEY / ZYVOPAY_WEBHOOK_SECRET / ZYVOPAY_BASE_URL). The key/secret are never shown again, never put in a page or log.
+  Requests are signed on the server: HMAC-SHA256(secret, timestamp + "." + exact JSON body). Paid only when the signed check says "successful"
+  and reference, order id, INR and the exact amount match. Credit happens once (safe against duplicates).
+  WEBHOOK: set  https://YOUR-SITE/zyvo/webhook  in the Paytm dashboard (signature header X-ZyvoPay-Signature is verified; bad signature = 401; duplicates ignored).
+QR: simple black/white QR, same look for both gateways. Paytm QR is made on the server from the exact payment_uri (instant, no outside QR service).
+  The payment page opens at once (no gateway call while loading) and checks the payment every 3 seconds. "Open UPI App" shows only if the gateway allows it.
+PRODUCT LOGO / EMOJI: Admin > Products > "Logo / premium emoji" on each product: upload a small picture and/or paste a Telegram premium emoji ID.
+  Shown next to the product name in Admin > Products and in the Generate Key page.
+RESELLER UPDATE: Admin > Gateway > set "Reseller Update price" (0 = closed). Users see "Reseller Update" in the left menu -> pay -> verified -> the account becomes a
+  RESELLER at once (reseller prices, API & Docs, Bot Make), balance and history stay, admin gets a "RESELLER UPDATE" alert.
+  Admin can also press "Make Reseller" on a user's Manage page.
