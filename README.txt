@@ -179,3 +179,11 @@ PRODUCT LOGO / EMOJI: Admin > Products > "Logo / premium emoji" on each product:
 RESELLER UPDATE: Admin > Gateway > set "Reseller Update price" (0 = closed). Users see "Reseller Update" in the left menu -> pay -> verified -> the account becomes a
   RESELLER at once (reseller prices, API & Docs, Bot Make), balance and history stay, admin gets a "RESELLER UPDATE" alert.
   Admin can also press "Make Reseller" on a user's Manage page.
+
+---- v13 ----
+BACKGROUND PICTURE: Admin > Logo & Theme > "Background picture" -> choose image -> Add background. Shows on every page (login, dashboard, admin).
+  Darkness (Light / Medium / Strong) keeps the text readable. "Remove background" brings the normal look back.
+PAYTM (ZYVO PAY): Admin > Gateway > Paytm: enter UPI ID + API Token -> "Save & connect Paytm". A Rs.1 test QR is made automatically;
+  if it works, Paytm turns ON by itself. Webhook secret / API URL are optional (Advanced).
+PRODUCT LOGO: Admin > Products > "Logo / premium emoji" under each product (picture upload or Telegram emoji ID). Shown as small chips on the Generate page.
+NO BALANCE: Generate Keys with too little balance now opens a popup with an "Add balance" button.

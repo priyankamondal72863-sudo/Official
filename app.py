@@ -712,6 +712,14 @@ def qr_png(data):
     return b.getvalue()
 
 
+def safe_svg(uri):
+    try:
+        return qr_svg(uri) if uri else None
+    except Exception as e:
+        print("[qr] %s" % e)
+        return None
+
+
 def parse_iso(v):
     try:
         from datetime import datetime
@@ -2429,25 +2437,36 @@ def admin_gateway():
             flash("Saved", "ok")
             return redirect("/admin/gateway")
         if a == "save_zy":
-            key, wh, base = f.get("zy_key", "").strip(), f.get("zy_whsec", "").strip(), f.get("zy_base", "").strip().rstrip("/")
+            key, upi = f.get("zy_key", "").strip(), f.get("zy_upi", "").strip()
+            wh, base = f.get("zy_whsec", "").strip(), f.get("zy_base", "").strip().rstrip("/")
             if base and not base.startswith("https://"):
                 flash("Paytm API URL must start with https://", "err")
                 return redirect("/admin/gateway")
+            if key and "." not in key:
+                flash("The API token must look like  public.secret  (copy the full token from your ZYVO PAY dashboard)", "err")
+                return redirect("/admin/gateway")
             if key:
-                if "." not in key:
-                    flash("The API key must look like  public.secret  (the full token from your ZYVO PAY dashboard)", "err")
-                    return redirect("/admin/gateway")
                 set_setting("zy_key", key)
+            set_setting("zy_upi", upi)
             if wh:
                 set_setting("zy_whsec", wh)
             set_setting("zy_base", base or ZY_DEFAULT_BASE)
-            flash("Paytm settings saved", "ok")
-            return redirect("/admin/gateway")
-        if a == "test_zy":
+            if not zy_ready():
+                flash("Enter your API token to finish the Paytm setup", "err")
+                return redirect("/admin/gateway")
+            try:                                        # automatic check: a Rs.1 QR (never credited to anybody)
+                oid = "TEST%s" % secrets.token_hex(6)
+                d = zy_create(oid, 1)
+                set_setting("gw_active", "paytm")       # works -> Paytm is switched ON by itself
+                test = dict(ok=True, svg=safe_svg(d["pay_uri"]), img=d["qr_url"], order=oid,
+                            who="Paytm", note="Paytm is connected and switched ON.")
+            except Exception as e:
+                test = dict(ok=False, msg=str(e), who="Paytm")
+        elif a == "test_zy":
             try:
                 oid = "TEST%s" % secrets.token_hex(6)
                 d = zy_create(oid, 1)
-                test = dict(ok=True, svg=qr_svg(d["pay_uri"]) if d["pay_uri"] else None, img=d["qr_url"], order=oid, who="Paytm")
+                test = dict(ok=True, svg=safe_svg(d["pay_uri"]), img=d["qr_url"], order=oid, who="Paytm")
             except Exception as e:
                 test = dict(ok=False, msg=str(e), who="Paytm")
         elif a == "save":
@@ -2472,7 +2491,7 @@ def admin_gateway():
     tops = q("SELECT t.*, r.username FROM topups t JOIN resellers r ON r.id=t.reseller_id ORDER BY t.id DESC LIMIT 20")
     return render_template("admin_gateway.html", base=gw_base(), upi=get_setting("gw_upi"),
                            tail=key[-4:] if key else "", test=test, tops=tops, amounts=", ".join(str(x) for x in wallet_amounts()),
-                           active=gw_active(), zy_tail=zk[-4:] if zk else "", zy_wh=bool(zw), zy_base=zb, zy_ok=zy_ready(),
+                           active=gw_active(), zy_upi=get_setting("zy_upi"), zy_tail=zk[-4:] if zk else "", zy_wh=bool(zw), zy_base=zb, zy_ok=zy_ready(),
                            upgrade_price=upgrade_price(), hook=request.host_url.rstrip("/") + "/zyvo/webhook", page="gateway")
 
 
@@ -2898,6 +2917,46 @@ def logo_image():
     return resp
 
 
+BG_MAX_BYTES = 12 * 1024 * 1024
+BG_DIM = {"low": 0.25, "mid": 0.45, "high": 0.65}
+
+
+@app.route("/bg")
+def bg_image():
+    d = get_setting("bg_data")
+    if not d:
+        abort(404)
+    resp = Response(base64.b64decode(d), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=604800"      # url carries ?v=<version>, so changes show at once
+    return resp
+
+
+@app.after_request
+def inject_background(resp):
+    """Shows the admin's background picture on EVERY page (login, dashboard, admin ...)."""
+    try:
+        if resp.status_code != 200 or resp.mimetype != "text/html" or resp.direct_passthrough:
+            return resp
+        ver = get_setting("bg_ver")
+        if not ver or not get_setting("bg_data"):
+            return resp
+        html = resp.get_data(as_text=True)
+        if "<body" not in html or 'id="sitebg"' in html:
+            return resp
+        dim = BG_DIM.get(get_setting("bg_dim", "mid"), 0.45)
+        css = ("<style id=sitebg-css>html body{background:transparent!important;background-image:none!important}"
+               "#sitebg{position:fixed;inset:0;z-index:-3;background:#000 url(/bg?v=%s) center/cover no-repeat;pointer-events:none}"
+               "#sitebg::after{content:'';position:absolute;inset:0;background:rgba(4,8,18,%s)}"
+               "html[data-mode=light] #sitebg::after{background:rgba(255,255,255,%s)}"
+               "</style>" % (_html.escape(ver), dim, round(dim * 0.7, 2)))
+        html = html.replace("</head>", css + "</head>", 1)
+        html = re.sub(r"(<body[^>]*>)", r'\1<div id="sitebg"></div>', html, count=1)
+        resp.set_data(html)
+    except Exception as e:
+        print("[bg] %s" % e)
+    return resp
+
+
 @app.route("/admin/branding", methods=["GET", "POST"])
 @admin_required
 def admin_branding():
@@ -2929,12 +2988,41 @@ def admin_branding():
             set_setting("logo_data", "")
             set_setting("logo_ver", "")
             flash("Logo removed - the default icon is shown again", "ok")
+        elif a == "bg":
+            f = request.files.get("bg")
+            raw = f.read(BG_MAX_BYTES + 1) if f and f.filename else b""
+            if not raw:
+                flash("Choose an image first", "err")
+            elif len(raw) > BG_MAX_BYTES:
+                flash("Image is too big (max 12 MB)", "err")
+            else:
+                try:
+                    import io
+                    from PIL import Image, ImageOps
+                    im = Image.open(io.BytesIO(raw))
+                    im.load()
+                    im = ImageOps.exif_transpose(im).convert("RGB")
+                    im.thumbnail((1600, 1600))
+                    buf = io.BytesIO()
+                    im.save(buf, "JPEG", quality=82, optimize=True)
+                    set_setting("bg_data", base64.b64encode(buf.getvalue()).decode())
+                    set_setting("bg_ver", str(int(time.time())))
+                    flash("Background saved. It now shows on every page (login, dashboard, admin).", "ok")
+                except Exception:
+                    flash("This file is not a valid image (use PNG, JPG, WEBP or GIF)", "err")
+        elif a == "bg_dim":
+            set_setting("bg_dim", request.form.get("dim") if request.form.get("dim") in BG_DIM else "mid")
+            flash("Saved", "ok")
+        elif a == "bg_remove":
+            set_setting("bg_data", "")
+            set_setting("bg_ver", "")
+            flash("Background removed", "ok")
         elif a == "look":
             set_setting("site_mode", "light" if request.form.get("mode") == "light" else "dark")
             set_setting("signup_on", "1" if request.form.get("signup") else "0")
             flash("Saved", "ok")
         return redirect("/admin/branding")
-    return render_template("admin_branding.html", has_logo=bool(get_setting("logo_data")),
+    return render_template("admin_branding.html", has_logo=bool(get_setting("logo_data")), has_bg=bool(get_setting("bg_data")), bg_dim=get_setting("bg_dim", "mid"),
                            mode=get_setting("site_mode", "dark"), signup=signup_on(), page="branding")
 
 
@@ -3099,7 +3187,7 @@ threading.Thread(target=keep_alive, daemon=True, name="keep-alive").start()
 threading.Thread(target=topup_worker, daemon=True, name="topup-worker").start()
 bot.start()                                   # Telegram bot (login codes, alerts, device approval)
 
-from templates_ui4 import TEMPLATES, ic  # noqa: E402
+from templates_ui5 import TEMPLATES, ic  # noqa: E402
 from markupsafe import Markup  # noqa: E402
 app.jinja_env.globals["ic"] = ic
 
