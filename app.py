@@ -13,7 +13,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "data")
 MUSIC_DIR = os.path.join(DATA_DIR, "music")
 os.makedirs(MUSIC_DIR, exist_ok=True)
 DB = os.path.join(DATA_DIR, "panel.db")
-ADMIN_USER = "RGCHEAT"  # fixed on purpose (env vars ignored) - change later
+ADMIN_USER = "NOVIX"  # fixed on purpose (env vars ignored) - change later
 ADMIN_PASS = "909090"
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET_MIN", "330")) * 60  # default IST
 MAX_MUSIC = 20
@@ -21,15 +21,41 @@ MAX_MUSIC = 20
 TG_BOT_TOKEN = ""   # NEVER write the bot token here (GitHub leak!). Set it in Admin > Telegram. Optional backup: Render env TG_BOT_TOKEN
 TG_ADMIN_ID = "6739795427"      # default admin Chat ID (not secret). Admin > Telegram can change it any time
 EMOJI_PACKS = [x for x in (os.environ.get("EMOJI_PACKS") or "RGCHEAT99,botd3,NewsEmoji").replace(" ", "").split(",") if x]   # premium emoji packs (first = highest priority)
-BRAND = "RG CHEAT"      # name shown on login + panel header
+BRAND = "NOVIX PLAYS"      # name shown on login + panel header
 CURRENCY = "₹"         # symbol shown before money amounts (all prices are INR)
 DEFAULT_API_BASE = "https://official-seller-4.onrender.com"   # main API server (editable in Admin > Main API)
 DEFAULT_MARKUP_RESELLER = 50    # % added on the main-API cost -> RESELLER price
 DEFAULT_MARKUP_USER = 200       # % added on the main-API cost -> USER price
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-me-" + ADMIN_PASS)
-app.config.update(SESSION_COOKIE_SAMESITE="Lax", MAX_CONTENT_LENGTH=250 * 1024 * 1024)
+def _load_secret_key():
+    """Never derive the session key from the admin password (anybody knowing it could forge an admin cookie and skip the code).
+    Use env SECRET_KEY, else a random key stored once in the data folder."""
+    k = os.environ.get("SECRET_KEY", "").strip()
+    if k:
+        return k
+    path = os.path.join(DATA_DIR, ".secret_key")
+    try:
+        with open(path) as fh:
+            k = fh.read().strip()
+    except OSError:
+        k = ""
+    if len(k) < 32:
+        k = secrets.token_hex(32)
+        try:
+            with open(path, "w") as fh:
+                fh.write(k)
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return k
+
+
+app.secret_key = _load_secret_key()
+app.config.update(SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL")),
+                  MAX_CONTENT_LENGTH=250 * 1024 * 1024)
+ADMIN_TTL = 8 * 3600     # an admin session ends after 8 hours -> new password + new Telegram code
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)   # real client IP / https behind Render
 
 
@@ -109,7 +135,8 @@ def init_db():
     rcols = [r[1] for r in c.execute("PRAGMA table_info(resellers)")]
     for col, ddl in (("theme", "TEXT DEFAULT ''"), ("tg_chat", "TEXT DEFAULT ''"),
                      ("otp_on", "INTEGER NOT NULL DEFAULT 1"), ("notify", "INTEGER NOT NULL DEFAULT 1"),
-                     ("low_bal", "REAL NOT NULL DEFAULT 50"), ("role", "TEXT NOT NULL DEFAULT 'reseller'")):
+                     ("low_bal", "REAL NOT NULL DEFAULT 50"), ("role", "TEXT NOT NULL DEFAULT 'reseller'"),
+                     ("deleted", "INTEGER NOT NULL DEFAULT 0"), ("deleted_at", "INTEGER NOT NULL DEFAULT 0")):
         if col not in rcols:
             c.execute("ALTER TABLE resellers ADD COLUMN %s %s" % (col, ddl))
     c.commit()
@@ -608,7 +635,7 @@ def reseller_required(f):
         if not session.get("rid"):
             return redirect("/login")
         r = q("SELECT * FROM resellers WHERE id=?", (session["rid"],), one=True)
-        if not r or not r["active"]:
+        if not r or not r["active"] or r["deleted"]:
             session.clear()
             return redirect("/login")
         if session.get("pwh") and session["pwh"] != pw_fp(r):     # password was changed elsewhere
@@ -640,8 +667,10 @@ def admin_required(f):
 
     @wraps(f)
     def w(*a, **k):
-        if not session.get("admin"):
-            return redirect("/admin/login")
+        if not session.get("admin") or time.time() - session.get("admin_ts", 0) > ADMIN_TTL:
+            session.pop("admin", None)                    # keep a half-finished login (adm_pre) alive
+            session.pop("admin_ts", None)
+            return redirect("/admin/verify" if admin_pre() else "/admin/login")
         return f(*a, **k)
     return w
 
@@ -695,7 +724,7 @@ def claim_admin(chat_id, secret):
     """Bot command '/admin <admin password>' makes that Telegram chat the admin (device requests go there)."""
     now = time.time()
     _CLAIMS[:] = [t for t in _CLAIMS if now - t < 600]
-    if len(_CLAIMS) >= 5:
+    if len(_CLAIMS) >= 5 or get_setting("adm_linked") == "1":      # after the first verified login the chat ID can only be changed inside the panel (with a code)
         return False
     if same(secret.strip(), ADMIN_PASS):
         set_setting("tg_admin", str(chat_id))
@@ -865,10 +894,23 @@ def send_otp(r, force=False):
       (r["id"], otp_hash(r["id"], code), now + 300, 0, now), commit=True)
     st = {"state": "sending", "err": "", "ts": now}
     _OTP_STATE[r["id"]] = st
-    text = ("<blockquote>\U0001F510 <b>Login verification</b></blockquote>\n\n"
-            "Use this one-time code to sign in to <b>%s</b>.\n\n<blockquote><code>%s</code></blockquote>\n\n"
-            "\u23F1 Expires in <b>5 minutes</b>.\n\U0001F6AB Keep this code private. Our team will never ask for it."
-            % (esc(BRAND), code))
+    if r["id"] == 0:                                     # ADMIN login code
+        text = ("<blockquote>\U0001F510 <b>ADMIN LOGIN CODE</b></blockquote>\n\n"
+                "Someone entered the correct admin password for <b>%s</b>.\n"
+                "\U0001F4F1 %s\n\U0001F310 IP: <code>%s</code>\n\U0001F552 %s\n\n"
+                "<blockquote><code>%s</code></blockquote>\n\n\u23F1 Expires in <b>5 minutes</b>.\n"
+                "\U0001F6AB If this was NOT you, do not share the code - change the admin password."
+                % (esc(BRAND), esc(ua_label(request.headers.get("User-Agent", ""))), esc(request.remote_addr),
+                   fmt(now), code))
+    elif r["id"] == -1:                                  # confirm a NEW admin chat id
+        text = ("<blockquote>\U0001F510 <b>CONFIRM ADMIN CHAT</b></blockquote>\n\n"
+                "This chat will become the <b>admin chat</b> of <b>%s</b> (login codes + alerts come here).\n\n"
+                "<blockquote><code>%s</code></blockquote>\n\n\u23F1 Expires in <b>5 minutes</b>." % (esc(BRAND), code))
+    else:
+        text = ("<blockquote>\U0001F510 <b>Login verification</b></blockquote>\n\n"
+                "Use this one-time code to sign in to <b>%s</b>.\n\n<blockquote><code>%s</code></blockquote>\n\n"
+                "\u23F1 Expires in <b>5 minutes</b>.\n\U0001F6AB Keep this code private. Our team will never ask for it."
+                % (esc(BRAND), code))
     chat, uname, rid = r["tg_chat"], r["username"], r["id"]
 
     def work():
@@ -1007,8 +1049,112 @@ def pre_reseller():
     p = session.get("pre")
     if not p or time.time() - p.get("ts", 0) > PRE_TTL:
         return None, None
-    r = q("SELECT * FROM resellers WHERE id=? AND active=1", (p["rid"],), one=True)
+    r = q("SELECT * FROM resellers WHERE id=? AND active=1 AND deleted=0", (p["rid"],), one=True)
     return (r, p) if r else (None, None)
+
+
+
+# ---------------------------------------------------------------- admin security (password + Telegram code, every login)
+def admin_pre():
+    p = session.get("adm_pre")
+    return p if p and time.time() - p.get("ts", 0) <= PRE_TTL else None
+
+
+def admin_pseudo(kind=0, chat=None):
+    """send_otp()/check_otp() work with a dict: id 0 = admin login code, id -1 = 'confirm new admin chat' code."""
+    return {"id": kind, "tg_chat": chat or tg_admin(), "username": ADMIN_USER}
+
+
+def admin_next_step(fresh=False):
+    if not tg_token() or not tg_admin():
+        return "/admin/setup"                                    # first time: bot token has to be connected
+    if rl_blocked("otp-send:0", 6, 600):
+        _OTP_STATE[0] = {"state": "fail", "err": "Too many codes requested. Wait a few minutes.", "ts": int(time.time())}
+    else:
+        rl_hit("otp-send:0")
+        send_otp(admin_pseudo(), force=fresh)
+    return "/admin/verify"
+
+
+@app.route("/admin/setup", methods=["GET", "POST"])
+def admin_setup():
+    """FIRST TIME only (no bot token saved yet): paste the bot API token -> it is linked -> a code is sent."""
+    if not admin_pre():
+        return redirect("/login")
+    need_token = not tg_token()
+    if not need_token and tg_admin():
+        return redirect("/admin/verify")
+    chat = request.form.get("chat_id", tg_admin() or TG_ADMIN_ID).strip() if request.method == "POST" else (tg_admin() or TG_ADMIN_ID)
+    if request.method == "POST":
+        tok = request.form.get("token", "").strip()
+        err = None
+        if rl_blocked("setup:" + (request.remote_addr or "?"), 8, 600):
+            err = "Too many attempts. Please wait 10 minutes."
+        elif not re.fullmatch(r"-?\d{5,15}", chat):
+            err = "Chat ID must be numbers only"
+        elif need_token and not re.fullmatch(r"\d{6,12}:[\w-]{30,60}", tok):
+            err = "That does not look like a bot token (get it from @BotFather)"
+        if not err and need_token:
+            ok, info = bot.check_token(tok)
+            if not ok and ("unauthorized" in info.lower() or "not found" in info.lower()):
+                err = "Telegram rejected this token (%s)" % info
+            else:
+                set_setting("tg_token", tok)
+                bot.token_changed()                              # bot is linked and running right now
+        if err:
+            rl_hit("setup:" + (request.remote_addr or "?"))
+            flash(err, "err")
+        else:
+            set_setting("tg_admin", chat)
+            session["adm_pre"] = dict(ts=int(time.time()))
+            return redirect(admin_next_step(fresh=True))
+    return render_template("admin_setup.html", title="Connect bot", need_token=need_token, chat_id=chat)
+
+
+@app.route("/admin/verify", methods=["GET", "POST"])
+def admin_verify():
+    if not admin_pre():
+        return redirect("/login")
+    if not tg_token() or not tg_admin():
+        return redirect("/admin/setup")
+    mk, ip = mask_id(tg_admin()), request.remote_addr or "?"
+    page = lambda: render_template("admin_verify.html", title="Admin verification", tg_mask=mk)
+    if request.method == "POST":
+        if request.form.get("action") == "resend":
+            if rl_blocked("otp-send:0", 6, 600):
+                flash("Too many codes requested. Wait a few minutes.", "err")
+            else:
+                rl_hit("otp-send:0")
+                send_otp(admin_pseudo(), force=True)
+                flash("A new code is being sent to the admin Telegram.", "ok")
+            return page()
+        if rl_blocked("otp:0", 6, 600) or rl_blocked("otpip:" + ip, 8, 600):
+            flash("Too many wrong codes. Please wait 10 minutes.", "err")
+            return page()
+        ok, msg = check_otp(0, request.form.get("code", ""))
+        if ok:
+            set_setting("adm_linked", "1")
+            session.clear()
+            session["admin"] = True
+            session["admin_ts"] = int(time.time())
+            try:
+                bot.send(tg_admin(), "<blockquote>\U0001F513 <b>ADMIN LOGIN</b></blockquote>\n\U0001F4F1 %s\n\U0001F310 IP: <code>%s</code>\n\U0001F552 %s"
+                         % (esc(ua_label(request.headers.get("User-Agent", ""))), esc(ip), fmt(time.time())), what="admin login alert")
+            except Exception:
+                pass
+            return redirect("/admin")
+        rl_hit("otp:0")
+        rl_hit("otpip:" + ip)
+        flash(msg, "err")
+    return page()
+
+
+@app.route("/admin/otp_status")
+def admin_otp_status():
+    if not admin_pre() and not session.get("admin"):
+        return jsonify(state="gone")
+    st = _OTP_STATE.get(-1 if request.args.get("k") == "-1" else 0) or {"state": "ok", "err": ""}
+    return jsonify(state=st["state"], err=st["err"][:200])
 
 
 # ---------------------------------------------------------------- public
@@ -1040,10 +1186,10 @@ def do_login():
             flash("Too many attempts. Please wait 10 minutes.", "err")
             return out(make_response(render_template("login.html", title="Login", action=request.path, signup=(request.path == "/login" and signup_on()), u=request.args.get("u", ""))))
         if same(u.upper(), ADMIN_USER.upper()) and same(pw, ADMIN_PASS):
-            session.clear()
-            session["admin"] = True
-            return out(redirect("/admin"))
-        for r in q("SELECT * FROM resellers WHERE lower(username)=lower(?)", (u,)):
+            session.clear()                               # password alone NEVER opens the admin panel (code from Telegram needed)
+            session["adm_pre"] = dict(ts=int(time.time()))
+            return out(redirect(admin_next_step(fresh=True)))
+        for r in q("SELECT * FROM resellers WHERE lower(username)=lower(?) AND deleted=0", (u,)):
             if check_password_hash(r["pw"], raw) or (pw != raw and check_password_hash(r["pw"], pw)):
                 if not r["active"]:
                     flash("Your account is disabled. Please contact admin.", "err")
@@ -1486,7 +1632,7 @@ def api_token():
 def api_auth():
     k = api_token()
     r = q("SELECT * FROM resellers WHERE api_key=?", (k,), one=True) if k else None
-    if not r or not r["active"] or r["role"] == "user":          # API is for resellers only
+    if not r or not r["active"] or r["deleted"] or r["role"] == "user":          # API is for resellers only
         return None
     return r
 
@@ -1614,11 +1760,12 @@ def admin_logout():
 @admin_required
 def admin_home():
     now = int(time.time())
-    st = dict(resellers=q("SELECT COUNT(*) FROM resellers", one=True)[0],
+    st = dict(resellers=q("SELECT COUNT(*) FROM resellers WHERE role!='user' AND deleted=0", one=True)[0],
+              users=q("SELECT COUNT(*) FROM resellers WHERE role='user' AND deleted=0", one=True)[0],
               products=q("SELECT COUNT(*) FROM products", one=True)[0],
               keys=q("SELECT COUNT(*) FROM license_keys", one=True)[0],
               revenue=q("SELECT COALESCE(SUM(price),0) FROM license_keys", one=True)[0],
-              credit=q("SELECT COALESCE(SUM(balance),0) FROM resellers", one=True)[0])
+              credit=q("SELECT COALESCE(SUM(balance),0) FROM resellers WHERE deleted=0", one=True)[0])
     recent = q("SELECT k.*, r.username FROM license_keys k JOIN resellers r ON r.id=k.reseller_id ORDER BY k.id DESC LIMIT 15")
     return render_template("admin_home.html", st=st, recent=recent, now=now, page="home")
 
@@ -1784,12 +1931,78 @@ def admin_resellers():
             except sqlite3.IntegrityError:
                 flash("Username already exists", "err")
         return redirect("/admin/resellers")
-    show = request.args.get("role", "reseller")
-    show = show if show in ("reseller", "user") else "reseller"
+    if request.args.get("role") == "user":
+        return redirect("/admin/users")
+    return render_accounts("reseller")
+
+
+def render_accounts(kind):
+    """ONE list for resellers and ONE for users (never mixed): tabs Active / Banned / Deleted + search."""
+    st = request.args.get("st", "active")
+    st = st if st in ("active", "banned", "deleted") else "active"
+    sq = request.args.get("q", "").strip()
+    roles = "r.role='user'" if kind == "user" else "r.role!='user'"
+    cond = {"active": "r.deleted=0 AND r.active=1", "banned": "r.deleted=0 AND r.active=0", "deleted": "r.deleted=1"}[st]
+    args = []
+    if sq:
+        cond += " AND lower(r.username) LIKE ?"
+        args.append("%" + sq.lower() + "%")
     rows = q("SELECT r.*, (SELECT COUNT(*) FROM license_keys k WHERE k.reseller_id=r.id) kc FROM resellers r "
-             "WHERE r.role=? ORDER BY r.id DESC", (show,))
-    cnt = {x["role"]: x["n"] for x in q("SELECT role, COUNT(*) n FROM resellers GROUP BY role")}
-    return render_template("admin_resellers.html", rows=rows, seen=seen_unlinked(), show=show, cnt=cnt, page="resellers")
+             "WHERE %s AND %s ORDER BY r.id DESC LIMIT 500" % (roles, cond), args)
+    c = q("SELECT SUM(deleted=0 AND active=1) a, SUM(deleted=0 AND active=0) b, SUM(deleted=1) d FROM resellers r WHERE %s" % roles, one=True)
+    cnt = dict(active=c["a"] or 0, banned=c["b"] or 0, deleted=c["d"] or 0)
+    return render_template("admin_accounts.html", kind=kind, rows=rows, st=st, sq=sq, cnt=cnt, seen=seen_unlinked(),
+                           base="/admin/users" if kind == "user" else "/admin/resellers",
+                           page="users" if kind == "user" else "resellers")
+
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@admin_required
+def admin_users():
+    if request.method == "POST":
+        u, p = request.form.get("username", "").strip(), request.form.get("password", "").strip()
+        if not u or not p:
+            flash("Username and password required", "err")
+        elif same(u.upper(), ADMIN_USER.upper()):
+            flash("This username is reserved for the admin", "err")
+        elif q("SELECT 1 FROM resellers WHERE lower(username)=lower(?)", (u,), one=True):
+            flash("Username already exists", "err")
+        else:
+            try:
+                q("INSERT INTO resellers(username,pw,balance,api_key,created,role,otp_on) VALUES(?,?,?,?,?,?,?)",
+                  (u, generate_password_hash(p), num(request.form.get("credit")), new_api_key(), int(time.time()), "user", 0), commit=True)
+                flash("User created", "ok")
+            except sqlite3.IntegrityError:
+                flash("Username already exists", "err")
+        return redirect("/admin/users")
+    return render_accounts("user")
+
+
+@app.route("/admin/account/<int:rid>/<act>", methods=["POST"])
+@admin_required
+def admin_account_action(rid, act):
+    """Ban / Unban / Delete (soft, can be undone) / Restore / Delete forever (only from the Deleted tab)."""
+    r = q("SELECT * FROM resellers WHERE id=?", (rid,), one=True) or abort(404)
+    if act == "ban":
+        q("UPDATE resellers SET active=0 WHERE id=?", (rid,), commit=True)
+        flash("%s is BANNED (cannot login, API stops)" % r["username"], "ok")
+    elif act == "unban":
+        q("UPDATE resellers SET active=1 WHERE id=?", (rid,), commit=True)
+        flash("%s is unbanned" % r["username"], "ok")
+    elif act == "delete":
+        q("UPDATE resellers SET deleted=1, deleted_at=? WHERE id=?", (int(time.time()), rid), commit=True)
+        flash("%s moved to Deleted. You can restore it any time." % r["username"], "ok")
+    elif act == "restore":
+        q("UPDATE resellers SET deleted=0, deleted_at=0 WHERE id=?", (rid,), commit=True)
+        flash("%s restored" % r["username"], "ok")
+    elif act == "purge":
+        if not r["deleted"]:
+            flash("Delete the account first, then you can delete it forever", "err")
+        else:
+            q("DELETE FROM resellers WHERE id=?", (rid,), commit=True)
+            flash("%s deleted forever" % r["username"], "ok")
+    nxt = request.form.get("next", "")
+    return redirect(nxt if nxt.startswith("/admin/") and "//" not in nxt else ("/admin/users" if r["role"] == "user" else "/admin/resellers"))
 
 
 @app.route("/admin/reseller/<int:rid>", methods=["GET", "POST"])
@@ -1856,9 +2069,8 @@ def admin_reseller(rid):
                     q("INSERT OR REPLACE INTO custom_prices(reseller_id,plan_id,price) VALUES(?,?,?)",
                       (rid, pl["id"], num(v)), commit=True)
             flash("Custom prices saved", "ok")
-        elif a == "delete":
-            q("DELETE FROM resellers WHERE id=?", (rid,), commit=True)
-            return redirect("/admin/resellers")
+        elif a in ("delete", "restore", "purge"):
+            return admin_account_action(rid, a)
         return redirect("/admin/reseller/%d" % rid)
     cat = catalog(rid)
     devs = q("SELECT * FROM devices WHERE reseller_id=? ORDER BY id DESC", (rid,))
@@ -1924,17 +2136,47 @@ def admin_telegram():
                     flash("New token saved - @%s is running now. No redeploy needed." % info.get("username", "bot"), "ok")
                 else:
                     flash("Token saved, but Telegram could not be reached to check it (%s)." % info, "err")
-            set_setting("tg_admin", adm_id)
             set_setting("dev_check", "1" if f.get("dev_check") else "0")
             set_setting("otp_global", "1" if f.get("otp_global") else "0")
             set_setting("prem_on", "1" if f.get("prem_on") else "0")
             if not tok:
                 flash("Telegram settings saved", "ok")
         elif a == "clear_token":
-            set_setting("tg_token", "")
-            bot.token_changed()
-            flash("Bot token removed. The bot is OFF until you paste a new token." if not tg_token()
-                  else "Panel token removed. Now using the Render env TG_BOT_TOKEN.", "ok")
+            flash("For security the bot token cannot be removed - paste a NEW token and press Save to replace it.", "err")
+        elif a == "chatid_start":
+            new = f.get("new_chat", "").strip()
+            if not re.fullmatch(r"-?\d{5,15}", new):
+                flash("Chat ID must be numbers only", "err")
+            elif rl_blocked("otp-send:-1", 5, 600):
+                flash("Too many codes requested. Wait a few minutes.", "err")
+            else:
+                rl_hit("otp-send:-1")
+                session["adm_newchat"] = dict(id=new, ts=int(time.time()))
+                send_otp(admin_pseudo(-1, new), force=True)
+                flash("A confirm code is being sent to the NEW chat. That chat must have pressed START in the bot.", "ok")
+        elif a == "chatid_confirm":
+            pend = session.get("adm_newchat")
+            if not pend or time.time() - pend["ts"] > 600:
+                session.pop("adm_newchat", None)
+                flash("Request expired. Start again.", "err")
+            elif rl_blocked("otp:-1", 6, 600):
+                flash("Too many wrong codes. Wait 10 minutes.", "err")
+            else:
+                ok, msg = check_otp(-1, f.get("code", ""))
+                if ok:
+                    old = tg_admin()
+                    set_setting("tg_admin", pend["id"])
+                    session.pop("adm_newchat", None)
+                    note = "<blockquote>\U0001F510 <b>ADMIN CHAT CHANGED</b></blockquote>\nAdmin login codes and alerts now go to the chat ending <code>%s</code>." % esc(pend["id"][-4:])
+                    if old and old != pend["id"]:
+                        bot.send(old, note, what="admin chat changed (old)")
+                    bot.send(pend["id"], note, what="admin chat changed (new)")
+                    flash("Admin Chat ID changed. Login codes now go to the new chat.", "ok")
+                else:
+                    rl_hit("otp:-1")
+                    flash(msg, "err")
+        elif a == "chatid_cancel":
+            session.pop("adm_newchat", None)
         elif a == "reset_emoji":
             set_setting("emoji_map", "{}")
             bot.refresh_map()
@@ -1964,7 +2206,8 @@ def admin_telegram():
                            sent_ok=bot.sent_ok, sent_fail=bot.sent_fail, seen=seen_unlinked(),
                            tok_src=tg_token_source(), roles=emoji_roles(), extras=emoji_extras(),
                            cat=bot.catalog(), n_over=len(emoji_overrides()),
-                           active=dev_check_on(), prem_on=get_setting("prem_on", "1") == "1", prem=bot.status(), page="telegram")
+                           active=dev_check_on(), prem_on=get_setting("prem_on", "1") == "1", prem=bot.status(), page="telegram",
+                           chat_pending=mask_id((session.get("adm_newchat") or {}).get("id", "")), admin_mask=mask_id(tg_admin()))
 
 
 def emoji_roles():
@@ -2470,7 +2713,7 @@ threading.Thread(target=keep_alive, daemon=True, name="keep-alive").start()
 threading.Thread(target=topup_worker, daemon=True, name="topup-worker").start()
 bot.start()                                   # Telegram bot (login codes, alerts, device approval)
 
-from templates_ui3 import TEMPLATES, ic  # noqa: E402
+from templates_ui4 import TEMPLATES, ic  # noqa: E402
 from markupsafe import Markup  # noqa: E402
 app.jinja_env.globals["ic"] = ic
 

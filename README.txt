@@ -148,3 +148,18 @@ MAIN API (old adminshops API removed): Admin > Main API > Server URL + API Token
   Plans imported from the OLD api are hidden and cannot be bought - delete them in Admin > Products and import again.
 LOGO: Admin > Logo & Theme: add / replace / remove the picture shown in the menu, login page and dashboard.
 LIGHT / DARK: sun/moon button at the top of every page (saved per browser). Admin sets the default look.
+
+---- v12 (part 1: name + admin security + users section) ----
+NAME: RG CHEAT -> NOVIX PLAYS everywhere (panel, bot messages, bot_main). Admin login: NOVIX / 909090.
+ADMIN SECURITY: the admin password alone no longer opens the panel.
+  First login (no bot token saved yet): username + password -> "Connect your bot" page -> paste the bot API token (checked with Telegram)
+  + admin Chat ID (default is already filled) -> a 6-digit code is sent to that chat -> enter it -> panel.
+  EVERY later login: username + password -> NEW 6-digit code in the admin Telegram chat (5 min, one use) -> panel. Cannot be switched off.
+  Admin session ends after 8 hours. Wrong codes / too many codes are rate-limited. Admin gets an "ADMIN LOGIN" alert after each login.
+  The bot token cannot be removed from the panel (only replaced). The /admin <password> bot command works only until the first verified admin login.
+  Session key is no longer derived from the admin password (random key saved in data/.secret_key, or env SECRET_KEY).
+ADMIN CHAT ID CHANGE: Admin > Telegram > "Admin Chat ID": type the new ID -> a code goes to the NEW chat -> type it -> saved. Old chat is notified. No code edit needed.
+USERS: separate admin menu item "Users" (never mixed into Resellers). Tabs Active / Banned / Deleted + search.
+  Ban / Unban, Delete (soft, can be restored), Restore, Delete forever (only from the Deleted tab). Same buttons for resellers.
+  Banned / deleted accounts cannot login and their API token stops working.
+NEXT (part 2): Paytm gateway + Fampay toggle + simple QR, product logo / premium emoji, "Reseller Update" for users.

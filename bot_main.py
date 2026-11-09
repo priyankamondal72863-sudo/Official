@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw, ImageFont
 # cv2/numpy are imported lazily inside QR decoding so multiple created bots
 # can start without each process paying the full OpenCV memory cost.
 
-# RG CHEAT SHOP — feature-preserving UI/emoji/price-list update
+# NOVIX PLAYS — feature-preserving UI/emoji/price-list update
 # Version: 2026-08-26 — FamPay setup state-machine + multi-bot resource isolation + duplicate-token guard
 # ID input safety patch: Telegram commands can no longer be saved as Product/Valid IDs.
 # Wallet checkout stability patch: keep the checkout message alive, prevent double-charge taps, and isolate slow key/API work from the Telegram callback worker.
@@ -178,10 +178,10 @@ def _env_list_of_ints(name):
     return list(dict.fromkeys(values))
 
 _load_external_runtime_config()
-BOT_BRAND_NAME = os.getenv('BOT_BRAND_NAME', 'RG CHEAT SHOP').strip() or 'RG CHEAT SHOP'
+BOT_BRAND_NAME = os.getenv('BOT_BRAND_NAME', 'NOVIX PLAYS').strip() or 'NOVIX PLAYS'
 # Short brand used in the admin panel title: the main bot keeps its classic "RG" title, every
 # created (reseller) bot shows its own name.
-BOT_BRAND_SHORT = 'RG' if BOT_BRAND_NAME == 'RG CHEAT SHOP' else BOT_BRAND_NAME
+BOT_BRAND_SHORT = 'NOVIX' if BOT_BRAND_NAME == 'NOVIX PLAYS' else BOT_BRAND_NAME
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
 ADMIN_IDS = _env_list_of_ints('BOT_ADMIN_IDS')
 # The IDs supplied when a bot is created are its source/root admins. They are
@@ -6621,7 +6621,7 @@ def _build_stylish_qr_image(payload, size=900):
     qr_img = qr_img.resize((size, size), Image.Resampling.NEAREST)
 
     output = io.BytesIO()
-    output.name = "rg_cheat_shop_upi_qr.png"
+    output.name = "novix_plays_upi_qr.png"
     qr_img.save(output, format="PNG", optimize=True)
     output.seek(0)
     return output
@@ -8276,7 +8276,7 @@ def _bot_creator_restart_instance(instance_id):
     env = _bot_creator_child_environment(
         token=saved_env.get('BOT_TOKEN', ''),
         admin_id=saved_env.get('BOT_ADMIN_IDS', '0'),
-        bot_name=saved_env.get('BOT_BRAND_NAME', 'RG CHEAT SHOP'),
+        bot_name=saved_env.get('BOT_BRAND_NAME', 'NOVIX PLAYS'),
         expiry=expires_at,
         instance_id=instance_id,
         child_dir=child_dir,
@@ -9380,7 +9380,7 @@ def _bot_creator_child_environment(token, admin_id, bot_name, expiry, instance_i
     env.update({
         'BOT_TOKEN': str(token).strip(),
         'BOT_ADMIN_IDS': str(int(admin_id)),
-        'BOT_BRAND_NAME': str(bot_name).strip() or 'RG CHEAT SHOP',
+        'BOT_BRAND_NAME': str(bot_name).strip() or 'NOVIX PLAYS',
         'BOT_CREATOR_ENABLED': '0',
         'BOT_EXPIRES_AT': str(expiry),
         'BOT_INSTANCE_ID': str(instance_id),
@@ -9627,7 +9627,7 @@ def _bot_creator_restore_children():
                 env = _bot_creator_child_environment(
                     token=saved_env.get('BOT_TOKEN', ''),
                     admin_id=saved_env.get('BOT_ADMIN_IDS', '0'),
-                    bot_name=saved_env.get('BOT_BRAND_NAME', 'RG CHEAT SHOP'),
+                    bot_name=saved_env.get('BOT_BRAND_NAME', 'NOVIX PLAYS'),
                     expiry=expires_at,
                     instance_id=instance_id,
                     child_dir=child_dir,
@@ -20295,7 +20295,7 @@ _start_reseller_api_http_server()
 # ==================== SINGLE-INSTANCE POLLING GUARD ====================
 # Telegram allows only one active getUpdates long-poll for a bot token.
 # This local lock prevents accidental double-launches from Termux.
-_POLL_LOCK_PATH = ".rg_cheat_shop_polling.lock"
+_POLL_LOCK_PATH = ".novix_plays_polling.lock"
 _poll_lock_file = None
 
 def acquire_single_instance_lock():

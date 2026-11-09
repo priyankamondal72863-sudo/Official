@@ -1,5 +1,5 @@
 """
-RG CHEAT - Telegram bot (runs INSIDE the website, no separate hosting needed).
+NOVIX PLAYS - Telegram bot (runs INSIDE the website, no separate hosting needed).
 
 What it does
   * Sends login codes (6 digit) to resellers
@@ -115,7 +115,7 @@ def _norm(e):
 
 
 class Bot:
-    def __init__(self, get_token, get_admin, on_device, brand="RG CHEAT", on_claim=None, on_seen=None,
+    def __init__(self, get_token, get_admin, on_device, brand="NOVIX PLAYS", on_claim=None, on_seen=None,
                  packs=None, prem_on=None, get_overrides=None):
         self.get_token = get_token          # () -> bot token (str)
         self.get_admin = get_admin          # () -> admin chat id (str)
